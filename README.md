@@ -36,3 +36,11 @@ Contains the code for calculating the magnetization of a given RDIM lattice. Fig
 ## ```PHASE_DIAGRAM_RDIM_MODEL.ipynb``` (Python)
 
 Contains the code for the generation of the phase diagram in chapter 9.
+
+## ```POWERLAW_FITS.m``` (Matlab)
+
+Contains the matlab code used for the MLE fits to the powerlaw. Data used for chapter 7 were generated using this code.
+
+## ```POWERLAW_ANALYSIS.ipynb``` (Python)
+
+Contains the code used for generating the powerlaw graphs from the data obtained in ```POWERLAW_FITS.m```. Figures from chapter 7 were generated using this code.
