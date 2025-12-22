@@ -1,0 +1,6 @@
+# Ignore generated / output binaries and images
+*.bin
+*.png
+
+# Ignore plain text outputs (e.g., simulation logs/parameters)
+*.txt
