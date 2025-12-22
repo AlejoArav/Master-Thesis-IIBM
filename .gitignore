@@ -4,3 +4,7 @@
 
 # Ignore plain text outputs (e.g., simulation logs/parameters)
 *.txt
+
+# OS / editor files
+.DS_Store
+.vscode/
