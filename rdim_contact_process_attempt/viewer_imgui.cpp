@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -33,6 +34,8 @@ struct ViewerHandle
     size_t window_size;
     size_t window_offset;
     ViewerFrameMeta last_meta{};
+    size_t expr_window_size;
+    size_t expr_window_offset;
 };
 
 namespace
@@ -157,6 +160,115 @@ namespace
         ImGui::Text("Window %.2f-%.2f / %.2f min", start_min, end_min, meta.total_minutes);
     }
 
+    struct ExprPlotContext
+    {
+        const double *history;
+        size_t start;
+        size_t total;
+    };
+
+    static float expr_plot_getter(void *data, int idx)
+    {
+        const auto *ctx = static_cast<const ExprPlotContext *>(data);
+        if (!ctx || !ctx->history || idx < 0)
+        {
+            return 0.0f;
+        }
+        const size_t pos = ctx->start + static_cast<size_t>(idx);
+        if (pos >= ctx->total)
+        {
+            return 0.0f;
+        }
+        return static_cast<float>(ctx->history[pos]);
+    }
+
+    static void render_expression_panel(ViewerHandle *viewer)
+    {
+        const ViewerFrameMeta &meta = viewer->last_meta;
+        if (!meta.gfp_history || !meta.rfp_history || meta.gfp_history_count < 2 || meta.rfp_history_count < 2)
+        {
+            ImGui::Text("Collecting GFP/RFP history...");
+            return;
+        }
+
+#if defined(IMGUI_VERSION_NUM) && IMGUI_VERSION_NUM >= 18967
+        ImGui::SeparatorText("GFP/RFP means");
+#else
+        ImGui::Separator();
+        ImGui::TextUnformatted("GFP/RFP means");
+#endif
+
+        const size_t available = std::min(meta.gfp_history_count, meta.rfp_history_count);
+        viewer->expr_window_size = std::max<size_t>(1, std::min(viewer->expr_window_size, available));
+        size_t max_offset = (available > viewer->expr_window_size) ? (available - viewer->expr_window_size) : 0;
+        viewer->expr_window_offset = std::min(viewer->expr_window_offset, max_offset);
+
+        int slider_offset = static_cast<int>(viewer->expr_window_offset);
+        const int slider_max = static_cast<int>(max_offset);
+        if (ImGui::SliderInt("Expr Timeline", &slider_offset, 0, slider_max))
+        {
+            viewer->expr_window_offset = static_cast<size_t>(slider_offset);
+        }
+
+        int window_size_int = static_cast<int>(viewer->expr_window_size);
+        const int max_window = std::max(1, static_cast<int>(available));
+        if (ImGui::SliderInt("Expr Window Samples", &window_size_int, 1, max_window))
+        {
+            viewer->expr_window_size = static_cast<size_t>(window_size_int);
+        }
+        viewer->expr_window_size = std::max<size_t>(1, std::min(viewer->expr_window_size, available));
+        max_offset = (available > viewer->expr_window_size) ? (available - viewer->expr_window_size) : 0;
+        viewer->expr_window_offset = std::min(viewer->expr_window_offset, max_offset);
+
+        const size_t display_count = std::min(viewer->expr_window_size, available - viewer->expr_window_offset);
+        if (display_count == 0)
+        {
+            ImGui::Text("Waiting for additional samples...");
+            return;
+        }
+
+        ExprPlotContext gctx{meta.gfp_history, viewer->expr_window_offset, meta.gfp_history_count};
+        ExprPlotContext rctx{meta.rfp_history, viewer->expr_window_offset, meta.rfp_history_count};
+
+        float min_v = FLT_MAX;
+        float max_v = -FLT_MAX;
+        for (size_t i = 0; i < display_count; ++i)
+        {
+            const size_t idx = viewer->expr_window_offset + i;
+            if (idx < meta.gfp_history_count)
+            {
+                const float v = static_cast<float>(meta.gfp_history[idx]);
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+            if (idx < meta.rfp_history_count)
+            {
+                const float v = static_cast<float>(meta.rfp_history[idx]);
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+        }
+        if (min_v == FLT_MAX || max_v == -FLT_MAX)
+        {
+            min_v = 0.0f;
+            max_v = 1.0f;
+        }
+        if (fabs(max_v - min_v) < 1e-6f)
+        {
+            max_v = min_v + 1e-3f;
+        }
+
+        ImGui::PlotLines("GFP mean", expr_plot_getter, &gctx,
+                         static_cast<int>(display_count), 0, nullptr, min_v, max_v, ImVec2(0, 80));
+        ImGui::PlotLines("RFP mean", expr_plot_getter, &rctx,
+                         static_cast<int>(display_count), 0, nullptr, min_v, max_v, ImVec2(0, 80));
+
+        const double start_min = meta.minutes_per_step * static_cast<double>(viewer->expr_window_offset);
+        const double end_index = viewer->expr_window_offset + display_count - 1;
+        const double end_min = meta.minutes_per_step * static_cast<double>(end_index);
+        ImGui::Text("Expr window %.2f-%.2f / %.2f min", start_min, end_min, meta.total_minutes);
+    }
+
     void render_ui(ViewerHandle *viewer)
     {
         ImGui_ImplSDL2_NewFrame();
@@ -174,7 +286,6 @@ namespace
         ImGui::Text("Mean Occupancy: %.3f", meta.occupancy_mean);
         ImGui::Text("Birth rate (legacy, unused): %.3e", meta.birth_rate);
         ImGui::Text("Initial occupancy: %.2f", meta.init_occupancy);
-        ImGui::TextColored(ImVec4(0.3f, 0.7f, 1.0f, 1.0f), "Blue channel highlights occupied cells");
         int stride = static_cast<int>(viewer->stride);
         if (ImGui::SliderInt("Stride", &stride, 10, 5000))
         {
@@ -186,9 +297,10 @@ namespace
             viewer->display_scale = zoom;
         }
         render_magnetization_panel(viewer);
+        render_expression_panel(viewer);
         ImVec2 image_size(static_cast<float>(viewer->width) * viewer->display_scale,
                           static_cast<float>(viewer->height) * viewer->display_scale);
-        ImGui::TextUnformatted("Expression (GFP/RFP + occupancy blue)");
+        ImGui::TextUnformatted("Expression (GFP/RFP)");
         ImGui::Image(viewer->expr_texture, image_size);
         ImGui::Separator();
         ImGui::TextUnformatted("Colonization / occupancy lattice");
@@ -224,6 +336,8 @@ ViewerHandle *viewer_create(size_t width, size_t height, size_t initial_stride)
     viewer->display_scale = 2.0f;
     viewer->window_size = 1024;
     viewer->window_offset = 0;
+    viewer->expr_window_size = 1024;
+    viewer->expr_window_offset = 0;
 
     viewer->window = SDL_CreateWindow("Contact-Process RDIM Viewer",
                                       SDL_WINDOWPOS_CENTERED,

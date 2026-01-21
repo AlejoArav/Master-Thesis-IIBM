@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <float.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -91,6 +92,41 @@ static FieldStats compute_field_stats(const double *field)
     return stats;
 }
 
+static FieldStats compute_field_stats_masked(const double *field, const double *cells, size_t *count_out)
+{
+    double min_v = DBL_MAX;
+    double max_v = -DBL_MAX;
+    double sum = 0.0;
+    size_t count = 0;
+    for (size_t k = 0; k < GRID_TOTAL; ++k)
+    {
+        if (cells && cells[k] > 0.5)
+        {
+            const double v = field[k];
+            ++count;
+            sum += v;
+            if (v < min_v)
+            {
+                min_v = v;
+            }
+            if (v > max_v)
+            {
+                max_v = v;
+            }
+        }
+    }
+    if (count_out)
+    {
+        *count_out = count;
+    }
+    if (count == 0)
+    {
+        return compute_field_stats(field);
+    }
+    FieldStats stats = {min_v, max_v, sum / (double)count};
+    return stats;
+}
+
 static inline uint8_t encode_uint8(double value, double min_val, double max_val)
 {
     const double denom = max_val - min_val;
@@ -133,17 +169,36 @@ static void compose_rgb_frame(const double *gfp, const double *rfp, const double
                               FieldStats *out_gfp, FieldStats *out_rfp,
                               double *out_mag, double *out_occ)
 {
-    FieldStats g_stats = compute_field_stats(gfp);
-    FieldStats r_stats = compute_field_stats(rfp);
+    size_t occ_count = 0;
+    FieldStats g_stats = compute_field_stats_masked(gfp, cells, &occ_count);
+    FieldStats r_stats = compute_field_stats_masked(rfp, cells, NULL);
     double occ_sum = 0.0;
     for (size_t k = 0; k < GRID_TOTAL; ++k)
     {
         const double occ = cells ? cells[k] : 0.0;
         occ_sum += occ;
-        rgb[3 * k + 0] = encode_uint8(rfp[k], r_stats.min, r_stats.max);
-        rgb[3 * k + 1] = encode_uint8(gfp[k], g_stats.min, g_stats.max);
-        const double clamped = occ < 0.0 ? 0.0 : (occ > 1.0 ? 1.0 : occ);
-        rgb[3 * k + 2] = (uint8_t)lrint(clamped * 255.0);
+        if (occ < 0.5)
+        {
+            rgb[3 * k + 0] = 0;
+            rgb[3 * k + 1] = 0;
+            rgb[3 * k + 2] = 0;
+            continue;
+        }
+        const uint8_t r_enc = encode_uint8(rfp[k], r_stats.min, r_stats.max);
+        const uint8_t g_enc = encode_uint8(gfp[k], g_stats.min, g_stats.max);
+        /* toggle-like coloring: only dominant channel is shown */
+        if (r_enc >= g_enc)
+        {
+            rgb[3 * k + 0] = r_enc;
+            rgb[3 * k + 1] = 0;
+        }
+        else
+        {
+            rgb[3 * k + 0] = 0;
+            rgb[3 * k + 1] = g_enc;
+        }
+        /* blue channel no longer encodes occupancy */
+        rgb[3 * k + 2] = 0;
     }
     if (out_mag)
     {
@@ -266,6 +321,16 @@ static inline double clip_nonnegative(double value)
     return value < 0.0 ? 0.0 : value;
 }
 
+static inline double sample_trunc_normal(RngState *rng, double mean, double sd, double min_v, double max_v)
+{
+    double val;
+    do
+    {
+        val = rng_normal(rng, mean, sd);
+    } while (val < min_v || val > max_v);
+    return val;
+}
+
 static double array_mean(const double *arr, size_t count)
 {
     double sum = 0.0;
@@ -334,8 +399,14 @@ typedef struct
     double *lap_C12;
     double *pLT;
     double *pLL;
+    double *nutrient;
+    double *nutrient_next;
+    double *lap_nutrient;
+    double *division_target;
 #ifdef WITH_GUI
     double *mag_history;
+    double *gfp_history;
+    double *rfp_history;
 #endif
 } SimulationArrays;
 
@@ -380,12 +451,57 @@ static int allocate_arrays(SimulationArrays *arr)
     ALLOC_FIELD(lap_C12);
     ALLOC_FIELD(pLT);
     ALLOC_FIELD(pLL);
+    ALLOC_FIELD(nutrient);
+    ALLOC_FIELD(nutrient_next);
+    ALLOC_FIELD(lap_nutrient);
+    ALLOC_FIELD(division_target);
 #ifdef WITH_GUI
     arr->mag_history = NULL;
+    arr->gfp_history = NULL;
+    arr->rfp_history = NULL;
 #endif
 
 #undef ALLOC_FIELD
     return 0;
+}
+
+/* helpers for division/movement */
+static inline void copy_intracellular(const SimulationArrays *arr, size_t src, size_t dst)
+{
+    arr->LUXI[dst] = arr->LUXI[src];
+    arr->LASI[dst] = arr->LASI[src];
+    arr->C6i[dst] = arr->C6i[src];
+    arr->C12i[dst] = arr->C12i[src];
+    arr->TETR[dst] = arr->TETR[src];
+    arr->LACI[dst] = arr->LACI[src];
+    arr->RFP[dst] = arr->RFP[src];
+    arr->GFP[dst] = arr->GFP[src];
+}
+
+static inline void clear_intracellular(SimulationArrays *arr, size_t idx)
+{
+    arr->LUXI[idx] = 0.0;
+    arr->LASI[idx] = 0.0;
+    arr->C6i[idx] = 0.0;
+    arr->C12i[idx] = 0.0;
+    arr->TETR[idx] = 0.0;
+    arr->LACI[idx] = 0.0;
+    arr->RFP[idx] = 0.0;
+    arr->GFP[idx] = 0.0;
+}
+
+static inline void move_cell_state(SimulationArrays *arr, size_t from, size_t to)
+{
+    arr->cells[to] = arr->cells[from];
+    arr->cells[from] = 0.0;
+
+    arr->volume[to] = arr->volume[from];
+    arr->volume[from] = 0.0;
+    arr->division_target[to] = arr->division_target[from];
+    arr->division_target[from] = 0.0;
+
+    copy_intracellular(arr, from, to);
+    clear_intracellular(arr, from);
 }
 
 static void free_arrays(SimulationArrays *arr)
@@ -425,8 +541,14 @@ static void free_arrays(SimulationArrays *arr)
     FREE_FIELD(lap_C12);
     FREE_FIELD(pLT);
     FREE_FIELD(pLL);
+    FREE_FIELD(nutrient);
+    FREE_FIELD(nutrient_next);
+    FREE_FIELD(lap_nutrient);
+    FREE_FIELD(division_target);
 #ifdef WITH_GUI
     free(arr->mag_history);
+    free(arr->gfp_history);
+    free(arr->rfp_history);
 #endif
 
 #undef FREE_FIELD
@@ -440,6 +562,10 @@ typedef struct
     double de_c12;
     double c6_conc;
     double c12_conc;
+    double nutrient_diffusion;
+    double nutrient_decay;
+    double nutrient_init;
+    double nutrient_uptake;
 } SimulationInput;
 
 typedef struct
@@ -449,6 +575,17 @@ typedef struct
     bool seed_center;
     double growth_rate;     /* exponential growth rate per minute */
     double division_volume; /* critical volume at which division is attempted */
+    int division_mode;      /* 0=B (Moore search with retries), 1=D (random Moore pick), 2=E (random radius pick) */
+    size_t division_radius; /* used by mode E; radius in Chebyshev distance layers */
+    double move_prob;       /* probability to attempt a move when division fails (modes D/E) */
+    double kappa;           /* nutrient half-saturation */
+    double xi;              /* toxin/public-good sensitivity */
+    double division_mean;
+    double division_sd;
+    double division_min;
+    double division_max;
+    size_t seed_count;      /* explicit number of initial occupied sites (random) */
+    double min_convergence_time; /* minutes before convergence stopping is considered */
 } ContactParams;
 
 typedef struct
@@ -507,6 +644,11 @@ static void initialize_state(SimulationArrays *arr, const SimulationInput *input
         const double v0 = occ > 0.5 ? 1.0 : 0.0;
         arr->volume[k] = v0;
         arr->volume_next[k] = v0;
+        arr->nutrient[k] = input->nutrient_init;
+        arr->nutrient_next[k] = input->nutrient_init;
+        const double div_target = sample_trunc_normal(rng, contact->division_mean, contact->division_sd,
+                                                      contact->division_min, contact->division_max);
+        arr->division_target[k] = div_target;
     }
 
     if (contact->seed_center)
@@ -515,12 +657,104 @@ static void initialize_state(SimulationArrays *arr, const SimulationInput *input
         memset(arr->cells_next, 0, GRID_TOTAL * sizeof(double));
         memset(arr->volume, 0, GRID_TOTAL * sizeof(double));
         memset(arr->volume_next, 0, GRID_TOTAL * sizeof(double));
+        memset(arr->division_target, 0, GRID_TOTAL * sizeof(double));
         const int center = N / 2;
         const size_t center_idx = idx(center, center);
         arr->cells[center_idx] = 1.0;
         arr->cells_next[center_idx] = 1.0;
         arr->volume[center_idx] = 1.0;
         arr->volume_next[center_idx] = 1.0;
+        const double div_target = sample_trunc_normal(rng, contact->division_mean, contact->division_sd,
+                                                      contact->division_min, contact->division_max);
+        arr->division_target[center_idx] = div_target;
+    }
+    else if (contact->seed_count > 0)
+    {
+        memset(arr->cells, 0, GRID_TOTAL * sizeof(double));
+        memset(arr->cells_next, 0, GRID_TOTAL * sizeof(double));
+        memset(arr->volume, 0, GRID_TOTAL * sizeof(double));
+        memset(arr->volume_next, 0, GRID_TOTAL * sizeof(double));
+        memset(arr->division_target, 0, GRID_TOTAL * sizeof(double));
+        const size_t max_seed = contact->seed_count > GRID_TOTAL ? GRID_TOTAL : contact->seed_count;
+        const size_t center = N / 2;
+        /* collect offsets around center sorted by manhattan then chebyshev distance */
+        size_t placed = 0;
+        const size_t radius = (size_t)ceil(sqrt((double)max_seed));
+        typedef struct
+        {
+            int dx;
+            int dy;
+            int manhattan;
+            int cheb;
+        } Offset;
+        const size_t max_offsets = (2 * radius + 1) * (2 * radius + 1);
+        Offset *offsets = (Offset *)malloc(max_offsets * sizeof(Offset));
+        size_t off_count = 0;
+        for (int dx = -(int)radius; dx <= (int)radius; ++dx)
+        {
+            for (int dy = -(int)radius; dy <= (int)radius; ++dy)
+            {
+                if (dx == 0 && dy == 0)
+                {
+                    continue;
+                }
+                offsets[off_count++] = (Offset){dx, dy, abs(dx) + abs(dy), (int)fmax(abs(dx), abs(dy))};
+            }
+        }
+        /* sort offsets by manhattan, then chebyshev, then |dx|,|dy| to prioritize near-center, cardinal first */
+        for (size_t a = 0; a + 1 < off_count; ++a)
+        {
+            for (size_t b = a + 1; b < off_count; ++b)
+            {
+                Offset oa = offsets[a];
+                Offset ob = offsets[b];
+                bool swap = false;
+                if (oa.manhattan > ob.manhattan)
+                    swap = true;
+                else if (oa.manhattan == ob.manhattan)
+                {
+                    if (oa.cheb > ob.cheb)
+                        swap = true;
+                    else if (oa.cheb == ob.cheb)
+                    {
+                        if (abs(oa.dx) + abs(oa.dy) > abs(ob.dx) + abs(ob.dy))
+                            swap = true;
+                    }
+                }
+                if (swap)
+                {
+                    offsets[a] = ob;
+                    offsets[b] = oa;
+                }
+            }
+        }
+        /* place center first */
+        const size_t center_idx = idx((int)center, (int)center);
+        arr->cells[center_idx] = 1.0;
+        arr->cells_next[center_idx] = 1.0;
+        arr->volume[center_idx] = 1.0;
+        arr->volume_next[center_idx] = 1.0;
+        arr->division_target[center_idx] = sample_trunc_normal(rng, contact->division_mean, contact->division_sd,
+                                                               contact->division_min, contact->division_max);
+        placed = 1;
+        for (size_t m = 0; m < off_count && placed < max_seed; ++m)
+        {
+            const int i = (int)center + offsets[m].dx;
+            const int j = (int)center + offsets[m].dy;
+            const size_t k = idx(i, j);
+            if (arr->cells[k] > 0.5)
+            {
+                continue;
+            }
+            arr->cells[k] = 1.0;
+            arr->cells_next[k] = 1.0;
+            arr->volume[k] = 1.0;
+            arr->volume_next[k] = 1.0;
+            arr->division_target[k] = sample_trunc_normal(rng, contact->division_mean, contact->division_sd,
+                                                          contact->division_min, contact->division_max);
+            ++placed;
+        }
+        free(offsets);
     }
 }
 
@@ -543,11 +777,28 @@ static void write_metadata(const char *dir_path, const SimulationInput *input,
     fprintf(f, "Dm_c12 = %.6e\n", input->dm_c12);
     fprintf(f, "Dext_c6 = %.6e\n", input->de_c6);
     fprintf(f, "Dext_c12 = %.6e\n", input->de_c12);
+    fprintf(f, "Initial_C6e = %.6e\n", input->c6_conc);
+    fprintf(f, "Initial_C12e = %.6e\n", input->c12_conc);
+    fprintf(f, "Nutrient_diffusion = %.6e\n", input->nutrient_diffusion);
+    fprintf(f, "Nutrient_decay = %.6e\n", input->nutrient_decay);
+    fprintf(f, "Nutrient_init = %.6e\n", input->nutrient_init);
+    fprintf(f, "Nutrient_uptake = %.6e\n", input->nutrient_uptake);
     fprintf(f, "Birth_rate = %.6e\n", contact->birth_rate);
     fprintf(f, "Init_occupancy = %.3f\n", contact->init_occupancy);
     fprintf(f, "Seed_center = %s\n", contact->seed_center ? "true" : "false");
+    fprintf(f, "Seed_count = %zu\n", contact->seed_count);
     fprintf(f, "Growth_rate = %.6e\n", contact->growth_rate);
     fprintf(f, "Division_volume = %.3f\n", contact->division_volume);
+    fprintf(f, "Division_mode = %d\n", contact->division_mode);
+    fprintf(f, "Division_radius = %zu\n", contact->division_radius);
+    fprintf(f, "Move_prob = %.3f\n", contact->move_prob);
+    fprintf(f, "Kappa = %.6e\n", contact->kappa);
+    fprintf(f, "Xi = %.6e\n", contact->xi);
+    fprintf(f, "Division_mean = %.3f\n", contact->division_mean);
+    fprintf(f, "Division_sd = %.3f\n", contact->division_sd);
+    fprintf(f, "Division_min = %.3f\n", contact->division_min);
+    fprintf(f, "Division_max = %.3f\n", contact->division_max);
+    fprintf(f, "Min_convergence_time = %.3f\n", contact->min_convergence_time);
     fclose(f);
 }
 
@@ -598,10 +849,14 @@ static void write_occupancy_snapshot(const char *dir_path, size_t snapshot_idx,
     fclose(f);
 }
 
-static double advance_step(SimulationArrays *arr, const SimulationInput *input)
+static double advance_step(SimulationArrays *arr, const SimulationInput *input, const ContactParams *params)
 {
+    /* global occupancy fraction (0-1) to mimic dilution in a finite chamber */
+    const double colony_fraction = array_mean(arr->cells, GRID_TOTAL);
+
     laplacian_pbc(arr->C6e, arr->lap_C6);
     laplacian_pbc(arr->C12e, arr->lap_C12);
+    laplacian_pbc(arr->nutrient, arr->lap_nutrient);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -628,6 +883,7 @@ static double advance_step(SimulationArrays *arr, const SimulationInput *input)
         const double laci = arr->LACI[k];
         const double rfp = arr->RFP[k];
         const double gfp = arr->GFP[k];
+        const double nutrient = arr->nutrient[k];
 
         const double enzyme_c6 = occ * (k_LUXI * luxi) / (KM_ENZ + luxi + 1e-12);
         const double enzyme_c12 = occ * (k_LASI * lasi) / (KM_ENZ + lasi + 1e-12);
@@ -637,8 +893,9 @@ static double advance_step(SimulationArrays *arr, const SimulationInput *input)
 
         const double c6i_next = c6i + (enzyme_c6 + occ * input->dm_c6 * (c6e - c6i) - d_HSLi * c6i) * DT;
         const double c12i_next = c12i + (enzyme_c12 + occ * input->dm_c12 * (c12e - c12i) - d_HSLi * c12i) * DT;
-        const double c6e_next = c6e + (occ * input->dm_c6 * (c6i - c6e) + input->de_c6 * arr->lap_C6[k] - d_HSLe * c6e) * DT;
-        const double c12e_next = c12e + (occ * input->dm_c12 * (c12i - c12e) + input->de_c12 * arr->lap_C12[k] - d_HSLe * c12e) * DT;
+        /* membrane exchange scaled by global occupancy to represent dilution */
+        const double c6e_next = c6e + (colony_fraction * occ * input->dm_c6 * (c6i - c6e) + input->de_c6 * arr->lap_C6[k] - d_HSLe * c6e) * DT;
+        const double c12e_next = c12e + (colony_fraction * occ * input->dm_c12 * (c12i - c12e) + input->de_c12 * arr->lap_C12[k] - d_HSLe * c12e) * DT;
 
         const double tetr_next = tetr + (expr_LL - d_p * tetr) * DT;
         const double laci_next = laci + (expr_LT - d_p * laci) * DT;
@@ -657,6 +914,11 @@ static double advance_step(SimulationArrays *arr, const SimulationInput *input)
         arr->LASI_next[k] = clip_nonnegative(lasi_next);
         arr->RFP_next[k] = clip_nonnegative(rfp_next);
         arr->GFP_next[k] = clip_nonnegative(gfp_next);
+
+        const double uptake = occ ? input->nutrient_uptake * arr->volume[k] * (nutrient / (params->kappa + nutrient + 1e-12)) : 0.0;
+        const double nutrient_next = nutrient + (input->nutrient_diffusion * arr->lap_nutrient[k] -
+                                                 input->nutrient_decay * nutrient - uptake) * DT;
+        arr->nutrient_next[k] = nutrient_next < 0.0 ? 0.0 : nutrient_next;
     }
 
     swap_arrays(&arr->C6i, &arr->C6i_next);
@@ -669,6 +931,7 @@ static double advance_step(SimulationArrays *arr, const SimulationInput *input)
     swap_arrays(&arr->LASI, &arr->LASI_next);
     swap_arrays(&arr->RFP, &arr->RFP_next);
     swap_arrays(&arr->GFP, &arr->GFP_next);
+    swap_arrays(&arr->nutrient, &arr->nutrient_next);
 
     const double mean_curr = array_mean(arr->GFP, GRID_TOTAL);
     const double mean_prev = array_mean(arr->GFP_next, GRID_TOTAL);
@@ -690,10 +953,15 @@ static void contact_process_step(SimulationArrays *arr, const ContactParams *par
 
             if (occupied)
             {
-                /* exponential volume growth: V(t+dt) = V(t) * exp(g*dt) */
                 const double v = arr->volume[k];
-                const double factor = exp(params->growth_rate * dt);
-                arr->volume[k] = v * factor;
+                const double n = arr->nutrient[k];
+                const double n_factor = n / (params->kappa + n + 1e-12);
+                const double toxin_factor = fmax(0.0, 1.0 - params->xi * 0.0); /* xi>0 if toxin coupled later */
+                const double dl = params->growth_rate * v * n_factor * toxin_factor * dt;
+                if (dl > 0.0)
+                {
+                    arr->volume[k] = v + dl;
+                }
             }
 
             arr->cells_next[k] = occ;
@@ -702,9 +970,9 @@ static void contact_process_step(SimulationArrays *arr, const ContactParams *par
 
     swap_arrays(&arr->cells, &arr->cells_next);
 
-    /* Step 2: division attempts for cells above critical volume into empty 8-neighbors */
-    static const int di[8] = {1, 1, 1, 0, 0, -1, -1, -1};
-    static const int dj[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    /* Step 2: division attempts (mode-dependent) and optional movement */
+    static const int moore_di[8] = {1, 1, 1, 0, 0, -1, -1, -1};
+    static const int moore_dj[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
 
     for (int i = 0; i < N; ++i)
     {
@@ -717,59 +985,168 @@ static void contact_process_step(SimulationArrays *arr, const ContactParams *par
             }
 
             double v = arr->volume[k];
-            if (v < params->division_volume)
+            const double target_len = arr->division_target[k] > 0.0 ? arr->division_target[k] : params->division_volume;
+            if (v < target_len)
             {
                 continue;
             }
 
-            /* pick a random ordering of 8 neighbors */
-            int order[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-            for (int m = 7; m > 0; --m)
-            {
-                const int r = (int)(rng_uniform(rng) * (double)(m + 1));
-                const int tmp = order[m];
-                order[m] = order[r];
-                order[r] = tmp;
-            }
-
             size_t daughter_idx = (size_t)-1;
-            for (int m = 0; m < 8; ++m)
+            if (params->division_mode == 0)
             {
-                const int ni = i + di[order[m]];
-                const int nj = j + dj[order[m]];
+                /* Mode B (default): random ordering of Moore neighbors with retries until an empty one is found */
+                int order[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+                for (int m = 7; m > 0; --m)
+                {
+                    const int r = (int)(rng_uniform(rng) * (double)(m + 1));
+                    const int tmp = order[m];
+                    order[m] = order[r];
+                    order[r] = tmp;
+                }
+                for (int m = 0; m < 8; ++m)
+                {
+                    const int ni = i + moore_di[order[m]];
+                    const int nj = j + moore_dj[order[m]];
+                    const size_t nk = idx(ni, nj);
+                    if (arr->cells[nk] < 0.5)
+                    {
+                        daughter_idx = nk;
+                        break;
+                    }
+                }
+            }
+            else if (params->division_mode == 1)
+            {
+                /* Mode D: single random Moore neighbor, no retries */
+                const int r = (int)(rng_uniform(rng) * 8.0);
+                const int ni = i + moore_di[r];
+                const int nj = j + moore_dj[r];
                 const size_t nk = idx(ni, nj);
                 if (arr->cells[nk] < 0.5)
                 {
                     daughter_idx = nk;
-                    break;
+                }
+            }
+            else /* params->division_mode == 2 */
+            {
+                /* Mode E: random offset within Chebyshev radius (layers), no retries */
+                size_t radius = params->division_radius < 1 ? 1 : params->division_radius;
+                int dx = 0;
+                int dy = 0;
+                /* sample until we get a non-zero offset within radius */
+                do
+                {
+                    dx = (int)(rng_uniform(rng) * (double)(2 * radius + 1)) - (int)radius;
+                    dy = (int)(rng_uniform(rng) * (double)(2 * radius + 1)) - (int)radius;
+                } while ((dx == 0 && dy == 0) || (abs(dx) > (int)radius) || (abs(dy) > (int)radius));
+
+                const int ni = i + dx;
+                const int nj = j + dy;
+                const size_t nk = idx(ni, nj);
+                if (arr->cells[nk] < 0.5)
+                {
+                    daughter_idx = nk;
                 }
             }
 
-            if (daughter_idx == (size_t)-1)
+            if (daughter_idx != (size_t)-1)
             {
-                /* no space to divide into this step */
-                continue;
+                /* symmetric division: reset mother and daughter volumes to half of division volume */
+                const double new_target_m = sample_trunc_normal(rng, params->division_mean, params->division_sd,
+                                                                params->division_min, params->division_max);
+                const double new_target_d = sample_trunc_normal(rng, params->division_mean, params->division_sd,
+                                                                params->division_min, params->division_max);
+                arr->division_target[k] = new_target_m;
+                arr->division_target[daughter_idx] = new_target_d;
+                const double v_old = arr->volume[k];
+                const double v_m = 0.5 * new_target_m;
+                const double v_d = 0.5 * new_target_d;
+                arr->volume[k] = v_m;
+                arr->volume[daughter_idx] = v_d;
+
+                /* occupy daughter site */
+                arr->cells[daughter_idx] = 1.0;
+
+                /* deterministic partition: conserve mass -> concentration = total_mass / total_new_volume */
+                const double total_vol = v_m + v_d;
+                const double inv_total_vol = (total_vol > 0.0) ? (1.0 / total_vol) : 0.0;
+                const double luxi_mass = arr->LUXI[k] * v_old;
+                const double lasi_mass = arr->LASI[k] * v_old;
+                const double c6i_mass = arr->C6i[k] * v_old;
+                const double c12i_mass = arr->C12i[k] * v_old;
+                const double tetr_mass = arr->TETR[k] * v_old;
+                const double laci_mass = arr->LACI[k] * v_old;
+                const double rfp_mass = arr->RFP[k] * v_old;
+                const double gfp_mass = arr->GFP[k] * v_old;
+
+                const double conc_luxi = luxi_mass * inv_total_vol;
+                const double conc_lasi = lasi_mass * inv_total_vol;
+                const double conc_c6i = c6i_mass * inv_total_vol;
+                const double conc_c12i = c12i_mass * inv_total_vol;
+                const double conc_tetr = tetr_mass * inv_total_vol;
+                const double conc_laci = laci_mass * inv_total_vol;
+                const double conc_rfp = rfp_mass * inv_total_vol;
+                const double conc_gfp = gfp_mass * inv_total_vol;
+
+                arr->LUXI[k] = conc_luxi;
+                arr->LASI[k] = conc_lasi;
+                arr->C6i[k] = conc_c6i;
+                arr->C12i[k] = conc_c12i;
+                arr->TETR[k] = conc_tetr;
+                arr->LACI[k] = conc_laci;
+                arr->RFP[k] = conc_rfp;
+                arr->GFP[k] = conc_gfp;
+
+                arr->LUXI[daughter_idx] = conc_luxi;
+                arr->LASI[daughter_idx] = conc_lasi;
+                arr->C6i[daughter_idx] = conc_c6i;
+                arr->C12i[daughter_idx] = conc_c12i;
+                arr->TETR[daughter_idx] = conc_tetr;
+                arr->LACI[daughter_idx] = conc_laci;
+                arr->RFP[daughter_idx] = conc_rfp;
+                arr->GFP[daughter_idx] = conc_gfp;
+                /* extracellular fields are left untouched; diffusion/exchange handles them */
+                /* optional movement after successful division for modes D/E */
+                if (params->division_mode != 0 && params->move_prob > 0.0 && rng_uniform(rng) <= params->move_prob)
+                {
+                    size_t target_idx = (size_t)-1;
+                    if (params->division_mode == 1)
+                    {
+                        const int r = (int)(rng_uniform(rng) * 8.0);
+                        const int ni = i + moore_di[r];
+                        const int nj = j + moore_dj[r];
+                        const size_t nk = idx(ni, nj);
+                        if (arr->cells[nk] < 0.5)
+                        {
+                            target_idx = nk;
+                        }
+                    }
+                    else /* mode E movement */
+                    {
+                        size_t radius = params->division_radius < 1 ? 1 : params->division_radius;
+                        int dx = 0;
+                        int dy = 0;
+                        do
+                        {
+                            dx = (int)(rng_uniform(rng) * (double)(2 * radius + 1)) - (int)radius;
+                            dy = (int)(rng_uniform(rng) * (double)(2 * radius + 1)) - (int)radius;
+                        } while ((dx == 0 && dy == 0) || (abs(dx) > (int)radius) || (abs(dy) > (int)radius));
+
+                        const int ni = i + dx;
+                        const int nj = j + dy;
+                        const size_t nk = idx(ni, nj);
+                        if (arr->cells[nk] < 0.5)
+                        {
+                            target_idx = nk;
+                        }
+                    }
+
+                    if (target_idx != (size_t)-1)
+                    {
+                        move_cell_state(arr, k, target_idx);
+                    }
+                }
             }
-
-            /* symmetric division: reset mother and daughter volumes to half of division volume */
-            const double v_daughter = params->division_volume * 0.5;
-            arr->volume[k] = v_daughter;
-            arr->volume[daughter_idx] = v_daughter;
-
-            /* occupy daughter site */
-            arr->cells[daughter_idx] = 1.0;
-
-            /* deterministic partition in concentration terms: copy concentrations */
-            arr->LUXI[daughter_idx] = arr->LUXI[k];
-            arr->LASI[daughter_idx] = arr->LASI[k];
-            arr->C6i[daughter_idx] = arr->C6i[k];
-            arr->C12i[daughter_idx] = arr->C12i[k];
-            arr->C6e[daughter_idx] = arr->C6e[k];
-            arr->C12e[daughter_idx] = arr->C12e[k];
-            arr->TETR[daughter_idx] = arr->TETR[k];
-            arr->LACI[daughter_idx] = arr->LACI[k];
-            arr->RFP[daughter_idx] = arr->RFP[k];
-            arr->GFP[daughter_idx] = arr->GFP[k];
         }
     }
 }
@@ -834,6 +1211,8 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
             else
             {
                 arrays.mag_history = (double *)calloc(max_steps, sizeof(double));
+                arrays.gfp_history = (double *)calloc(max_steps, sizeof(double));
+                arrays.rfp_history = (double *)calloc(max_steps, sizeof(double));
                 if (!arrays.mag_history)
                 {
                     fprintf(stderr, "Failed to allocate magnetization history, disabling timeline.\n");
@@ -885,9 +1264,14 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
             viewer_poll(viewer);
         }
 #endif
-        convergence = advance_step(&arrays, input);
+        convergence = advance_step(&arrays, input, &cfg->contact);
         contact_process_step(&arrays, &cfg->contact, &rng);
         apply_cell_mask(&arrays);
+        const double sim_minutes = step * DT;
+        if (sim_minutes < cfg->contact.min_convergence_time)
+        {
+            convergence = cfg->tolerance + 1.0; /* skip convergence check before threshold */
+        }
         ++step;
 
 #ifdef WITH_GUI
@@ -895,9 +1279,23 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
         if (viewer)
         {
             magnetization = compute_magnetization(arrays.GFP, arrays.RFP);
-            if (arrays.mag_history && history_index < max_steps)
+            if (history_index < max_steps)
             {
-                arrays.mag_history[history_index++] = magnetization;
+                const double g_mean_hist = array_mean(arrays.GFP, GRID_TOTAL);
+                const double r_mean_hist = array_mean(arrays.RFP, GRID_TOTAL);
+                if (arrays.mag_history)
+                {
+                    arrays.mag_history[history_index] = magnetization;
+                }
+                if (arrays.gfp_history)
+                {
+                    arrays.gfp_history[history_index] = g_mean_hist;
+                }
+                if (arrays.rfp_history)
+                {
+                    arrays.rfp_history[history_index] = r_mean_hist;
+                }
+                ++history_index;
             }
         }
 #endif
@@ -952,21 +1350,26 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
                     occ_rgb[3 * k + 1] = v;
                     occ_rgb[3 * k + 2] = v;
                 }
-                ViewerFrameMeta meta = {
-                    .step = step,
-                    .sim_minutes = step * DT,
-                    .convergence = convergence,
-                    .gfp_mean = g_stats.mean,
-                    .magnetization = frame_mag,
-                    .rfp_mean = r_stats.mean,
-                    .occupancy_mean = occ_mean,
-                    .birth_rate = cfg->contact.birth_rate,
-                    .init_occupancy = cfg->contact.init_occupancy,
-                    .mag_history = arrays.mag_history,
-                    .mag_history_count = history_index,
-                    .mag_history_capacity = max_steps,
-                    .minutes_per_step = DT,
-                    .total_minutes = cfg->final_time_minutes};
+                    ViewerFrameMeta meta = {
+                        .step = step,
+                        .sim_minutes = step * DT,
+                        .convergence = convergence,
+                        .gfp_mean = g_stats.mean,
+                        .magnetization = frame_mag,
+                        .rfp_mean = r_stats.mean,
+                        .occupancy_mean = occ_mean,
+                        .birth_rate = cfg->contact.birth_rate,
+                        .init_occupancy = cfg->contact.init_occupancy,
+                        .mag_history = arrays.mag_history,
+                        .mag_history_count = history_index,
+                        .mag_history_capacity = max_steps,
+                        .gfp_history = arrays.gfp_history,
+                        .rfp_history = arrays.rfp_history,
+                        .gfp_history_count = history_index,
+                        .rfp_history_count = history_index,
+                        .expr_history_capacity = max_steps,
+                        .minutes_per_step = DT,
+                        .total_minutes = cfg->final_time_minutes};
                 viewer_submit_frame(viewer,
                                     viz_rgb, GRID_TOTAL * 3,
                                     occ_rgb, occ_bytes,
@@ -1022,6 +1425,22 @@ typedef struct
     size_t viz_stride;
     bool seed_center;
     bool no_convergence_stop;
+    double c6_conc_override;
+    double c12_conc_override;
+    int division_mode;
+    size_t division_radius;
+    double move_prob;
+    double nutrient_init;
+    double nutrient_diffusion;
+    double nutrient_decay;
+    double nutrient_uptake;
+    double kappa;
+    double division_mean;
+    double division_sd;
+    double division_min;
+    double division_max;
+    size_t seed_count;
+    double min_convergence_time;
 } CliOptions;
 
 static void set_default_cli(CliOptions *opts)
@@ -1043,6 +1462,22 @@ static void set_default_cli(CliOptions *opts)
     opts->viz_stride = 500;
     opts->seed_center = false;
     opts->no_convergence_stop = false;
+    opts->c6_conc_override = NAN;
+    opts->c12_conc_override = NAN;
+    opts->division_mode = 0;     /* default: Mode B (Moore with retries) */
+    opts->division_radius = 1;   /* used only for Mode E */
+    opts->move_prob = 1.0;       /* used for Modes D/E */
+    opts->nutrient_init = 1.0;
+    opts->nutrient_diffusion = 500.0 / 60.0; /* 500 um^2/hr -> per minute */
+    opts->nutrient_decay = 0.0;
+    opts->nutrient_uptake = 2.0 / 60.0;      /* 2 hr^-1 -> per minute */
+    opts->kappa = 0.333;
+    opts->division_mean = 4.0;
+    opts->division_sd = 0.3;
+    opts->division_min = 2.5;
+    opts->division_max = 5.5;
+    opts->seed_count = 0;
+    opts->min_convergence_time = 0.0;
 }
 
 static void print_usage(const char *prog)
@@ -1060,11 +1495,27 @@ static void print_usage(const char *prog)
     printf("  --growth-rate VALUE   Exponential volume growth rate per minute (default 0.03)\n");
     printf("  --division-volume V   Volume threshold for division (default 2.0)\n");
     printf("  --seed-center         Override occupancy to a single central cell\n");
+    printf("  --seed-count N        Override occupancy to exactly N random occupied sites\n");
     printf("  --no-convergence-stop Run until max-steps/final-time without checking convergence\n");
     printf("  --gui                 Enable SDL2 + ImGui live viewer (requires GUI build)\n");
     printf("  --viz-stride N        Steps between viewer refreshes (default 500)\n");
     printf("  --dm-index N          Restrict to membrane diffusion index N (optional)\n");
     printf("  --de-index N          Restrict to external diffusion index N (optional)\n");
+    printf("  --c6-conc VALUE       Override initial extracellular C6 concentration (default table-driven)\n");
+    printf("  --c12-conc VALUE      Override initial extracellular C12 concentration (default 0)\n");
+    printf("  --division-mode M     Division neighborhood mode: B (default, Moore with retries), D (random Moore pick), E (random radius pick)\n");
+    printf("  --division-radius N   Radius (layers) for Mode E (Chebyshev distance, default 1)\n");
+    printf("  --move-prob P         Probability of attempting movement when division fails in Modes D/E (default 1.0)\n");
+    printf("  --min-conv-time MIN   Do not check convergence until this simulated minute (default 0)\n");
+    printf("  --nutrient-init V     Initial nutrient concentration (default 1.0)\n");
+    printf("  --nutrient-diffusion D   Nutrient diffusion coefficient (default 0.01)\n");
+    printf("  --nutrient-decay R    Nutrient decay rate (default 0)\n");
+    printf("  --nutrient-uptake R   Nutrient uptake rate per unit length (default 0.1)\n");
+    printf("  --kappa V             Nutrient half-saturation constant (default 0.5)\n");
+    printf("  --division-mean V     Mean division length (um) (default 4.0)\n");
+    printf("  --division-sd V       Std dev division length (um) (default 0.3)\n");
+    printf("  --division-min V      Min (truncation) division length (default 2.5)\n");
+    printf("  --division-max V      Max (truncation) division length (default 5.5)\n");
     printf("  --quiet               Reduce stdout logging\n");
     printf("  --help                Show this message\n");
 }
@@ -1134,6 +1585,99 @@ static bool parse_cli(int argc, char **argv, CliOptions *opts)
         else if (strcmp(argv[i], "--seed-center") == 0)
         {
             opts->seed_center = true;
+        }
+        else if (strcmp(argv[i], "--min-conv-time") == 0 && i + 1 < argc)
+        {
+            opts->min_convergence_time = atof(argv[++i]);
+            if (opts->min_convergence_time < 0.0)
+            {
+                opts->min_convergence_time = 0.0;
+            }
+        }
+        else if (strcmp(argv[i], "--seed-count") == 0 && i + 1 < argc)
+        {
+            opts->seed_count = (size_t)strtoull(argv[++i], NULL, 10);
+        }
+        else if (strcmp(argv[i], "--division-mode") == 0 && i + 1 < argc)
+        {
+            const char m = argv[++i][0];
+            if (m == 'B' || m == 'b')
+            {
+                opts->division_mode = 0;
+            }
+            else if (m == 'D' || m == 'd')
+            {
+                opts->division_mode = 1;
+            }
+            else if (m == 'E' || m == 'e')
+            {
+                opts->division_mode = 2;
+            }
+            else
+            {
+                fprintf(stderr, "Unknown division mode '%c', using default B.\n", m);
+                opts->division_mode = 0;
+            }
+        }
+        else if (strcmp(argv[i], "--division-radius") == 0 && i + 1 < argc)
+        {
+            opts->division_radius = (size_t)strtoull(argv[++i], NULL, 10);
+            if (opts->division_radius < 1)
+            {
+                opts->division_radius = 1;
+            }
+        }
+        else if (strcmp(argv[i], "--move-prob") == 0 && i + 1 < argc)
+        {
+            opts->move_prob = atof(argv[++i]);
+            if (opts->move_prob < 0.0)
+            {
+                opts->move_prob = 0.0;
+            }
+        }
+        else if (strcmp(argv[i], "--nutrient-init") == 0 && i + 1 < argc)
+        {
+            opts->nutrient_init = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--nutrient-diffusion") == 0 && i + 1 < argc)
+        {
+            opts->nutrient_diffusion = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--nutrient-decay") == 0 && i + 1 < argc)
+        {
+            opts->nutrient_decay = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--nutrient-uptake") == 0 && i + 1 < argc)
+        {
+            opts->nutrient_uptake = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--kappa") == 0 && i + 1 < argc)
+        {
+            opts->kappa = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--division-mean") == 0 && i + 1 < argc)
+        {
+            opts->division_mean = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--division-sd") == 0 && i + 1 < argc)
+        {
+            opts->division_sd = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--division-min") == 0 && i + 1 < argc)
+        {
+            opts->division_min = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--division-max") == 0 && i + 1 < argc)
+        {
+            opts->division_max = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--c6-conc") == 0 && i + 1 < argc)
+        {
+            opts->c6_conc_override = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--c12-conc") == 0 && i + 1 < argc)
+        {
+            opts->c12_conc_override = atof(argv[++i]);
         }
         else if (strcmp(argv[i], "--quiet") == 0)
         {
@@ -1215,13 +1759,19 @@ int main(int argc, char **argv)
             printf("GUI mode: DM[%zu]=%.4f, De[%zu]=%.4f\n",
                    dm_selected, DM_COEFFS[dm_selected], de_selected, DEXT_COEFFS[de_selected]);
         }
+        const double c6_init = isnan(cli.c6_conc_override) ? C6_CONCS[dm_selected] : cli.c6_conc_override;
+        const double c12_init = isnan(cli.c12_conc_override) ? 0.0 : cli.c12_conc_override;
         SimulationInput input = {
             .dm_c6 = DM_COEFFS[dm_selected],
             .dm_c12 = DM_COEFFS[dm_selected],
             .de_c6 = DEXT_COEFFS[de_selected],
             .de_c12 = DEXT_COEFFS[de_selected],
-            .c6_conc = C6_CONCS[dm_selected],
-            .c12_conc = 0.0};
+            .c6_conc = c6_init,
+            .c12_conc = c12_init,
+            .nutrient_diffusion = cli.nutrient_diffusion,
+            .nutrient_decay = cli.nutrient_decay,
+            .nutrient_init = cli.nutrient_init,
+            .nutrient_uptake = cli.nutrient_uptake};
         SimulationRunConfig cfg = {
             .final_time_minutes = cli.final_time_minutes,
             .tolerance = cli.tolerance,
@@ -1239,7 +1789,18 @@ int main(int argc, char **argv)
                 .init_occupancy = cli.init_occupancy,
                 .seed_center = cli.seed_center,
                 .growth_rate = cli.growth_rate,
-                .division_volume = cli.division_volume}};
+                .division_volume = cli.division_volume,
+                .division_mode = cli.division_mode,
+                .division_radius = cli.division_radius,
+                .move_prob = cli.move_prob,
+                .kappa = cli.kappa,
+                .xi = 0.0,
+                .division_mean = cli.division_mean,
+                .division_sd = cli.division_sd,
+                .division_min = cli.division_min,
+                .division_max = cli.division_max,
+                .seed_count = cli.seed_count,
+                .min_convergence_time = cli.min_convergence_time}};
         const int status = run_simulation(&input, &cfg);
         return status == 0 ? 0 : 1;
     }
@@ -1275,13 +1836,19 @@ int main(int argc, char **argv)
 #endif
             for (size_t job = dm_start; job < dm_end; ++job)
             {
+                const double c6_init = isnan(cli.c6_conc_override) ? C6_CONCS[job] : cli.c6_conc_override;
+                const double c12_init = isnan(cli.c12_conc_override) ? 0.0 : cli.c12_conc_override;
                 SimulationInput input = {
                     .dm_c6 = DM_COEFFS[job],
                     .dm_c12 = DM_COEFFS[job],
                     .de_c6 = de_c6,
                     .de_c12 = de_c12,
-                    .c6_conc = C6_CONCS[job],
-                    .c12_conc = 0.0};
+                    .c6_conc = c6_init,
+                    .c12_conc = c12_init,
+                    .nutrient_diffusion = cli.nutrient_diffusion,
+                    .nutrient_decay = cli.nutrient_decay,
+                    .nutrient_init = cli.nutrient_init,
+                    .nutrient_uptake = cli.nutrient_uptake};
 
                 SimulationRunConfig cfg = {
                     .final_time_minutes = cli.final_time_minutes,
@@ -1300,7 +1867,18 @@ int main(int argc, char **argv)
                         .init_occupancy = cli.init_occupancy,
                         .seed_center = cli.seed_center,
                         .growth_rate = cli.growth_rate,
-                        .division_volume = cli.division_volume}};
+                        .division_volume = cli.division_volume,
+                        .division_mode = cli.division_mode,
+                        .division_radius = cli.division_radius,
+                        .move_prob = cli.move_prob,
+                        .kappa = cli.kappa,
+                        .xi = 0.0,
+                        .division_mean = cli.division_mean,
+                        .division_sd = cli.division_sd,
+                        .division_min = cli.division_min,
+                        .division_max = cli.division_max,
+                        .seed_count = cli.seed_count,
+                        .min_convergence_time = cli.min_convergence_time}};
 
                 const int status = run_simulation(&input, &cfg);
                 if (status != 0)

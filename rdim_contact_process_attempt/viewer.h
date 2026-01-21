@@ -21,6 +21,11 @@ typedef struct
     const double *mag_history;
     size_t mag_history_count;
     size_t mag_history_capacity;
+    const double *gfp_history;
+    const double *rfp_history;
+    size_t gfp_history_count;
+    size_t rfp_history_count;
+    size_t expr_history_capacity;
     double minutes_per_step;
     double total_minutes;
 } ViewerFrameMeta;
