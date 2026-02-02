@@ -21,15 +21,27 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define N 256
 #define DOMAIN_SIZE 256.0
 #define DT 0.001
 #define SNAPSHOT_STRIDE_DEFAULT 1000
 #define OUTPUT_DIR_DEFAULT "c_rdim_outputs"
 
-static const double DH = DOMAIN_SIZE / (double)N;
-static const double DH2_INV = 1.0 / (DH * DH);
-static const size_t GRID_TOTAL = (size_t)N * (size_t)N;
+static int GRID_N = 256;
+static double DH = DOMAIN_SIZE / 256.0;
+static double DH2_INV = 1.0 / (256.0 * 256.0 / (DOMAIN_SIZE * DOMAIN_SIZE));
+static size_t GRID_TOTAL = (size_t)256 * (size_t)256;
+
+static void set_grid_geometry(int n)
+{
+    if (n < 4)
+    {
+        n = 4;
+    }
+    GRID_N = n;
+    DH = DOMAIN_SIZE / (double)GRID_N;
+    DH2_INV = 1.0 / (DH * DH);
+    GRID_TOTAL = (size_t)GRID_N * (size_t)GRID_N;
+}
 
 /* Biochemical parameters */
 static const double k_tx = 1e-1;
@@ -158,7 +170,7 @@ static void compose_rgb_frame(const double *gfp, const double *rfp, uint8_t *rgb
 
 static inline size_t idx(int i, int j)
 {
-    return (size_t)i * (size_t)N + (size_t)j;
+    return (size_t)i * (size_t)GRID_N + (size_t)j;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -404,11 +416,14 @@ typedef struct
     double de_c12;
     double c6_conc;
     double c12_conc;
+    double c6_noise_frac;
+    double c12_noise_frac;
 } SimulationInput;
 
 typedef struct
 {
     double final_time_minutes;
+    double min_conv_minutes;
     double tolerance;
     size_t max_steps;
     size_t snapshot_stride;
@@ -426,14 +441,14 @@ static void laplacian_pbc(const double *field, double *out)
 #ifdef _OPENMP
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
-    for (int i = 0; i < N; ++i)
+    for (int i = 0; i < GRID_N; ++i)
     {
-        const int ip = (i + 1 == N) ? 0 : i + 1;
-        const int im = (i == 0) ? (N - 1) : i - 1;
-        for (int j = 0; j < N; ++j)
+        const int ip = (i + 1 == GRID_N) ? 0 : i + 1;
+        const int im = (i == 0) ? (GRID_N - 1) : i - 1;
+        for (int j = 0; j < GRID_N; ++j)
         {
-            const int jp = (j + 1 == N) ? 0 : j + 1;
-            const int jm = (j == 0) ? (N - 1) : j - 1;
+            const int jp = (j + 1 == GRID_N) ? 0 : j + 1;
+            const int jm = (j == 0) ? (GRID_N - 1) : j - 1;
             const size_t center = idx(i, j);
             const double lap = 0.5 * field[idx(ip, j)] + 0.5 * field[idx(im, j)] +
                                0.5 * field[idx(i, jp)] + 0.5 * field[idx(i, jm)] +
@@ -449,14 +464,14 @@ static void initialize_state(SimulationArrays *arr, const SimulationInput *input
 {
     for (size_t k = 0; k < GRID_TOTAL; ++k)
     {
-        const double noise_c6 = rng_normal(rng, input->c6_conc, input->c6_conc * 0.25);
-        const double noise_c12 = rng_normal(rng, input->c12_conc, input->c12_conc * 0.25);
+        const double noise_c6 = rng_normal(rng, input->c6_conc, input->c6_conc * input->c6_noise_frac);
+        const double noise_c12 = rng_normal(rng, input->c12_conc, input->c12_conc * input->c12_noise_frac);
         arr->C6e[k] = clip_nonnegative(noise_c6);
         arr->C12e[k] = clip_nonnegative(noise_c12);
     }
 }
 
-static void write_metadata(const char *dir_path, const SimulationInput *input)
+static void write_metadata(const char *dir_path, const SimulationInput *input, const SimulationRunConfig *cfg)
 {
     char file_path[1024];
     snprintf(file_path, sizeof(file_path), "%s/simulation_parameters.txt", dir_path);
@@ -475,12 +490,16 @@ static void write_metadata(const char *dir_path, const SimulationInput *input)
     fprintf(f, "n_R = %.2f\n", n_R);
     fprintf(f, "n_S = %.2f\n", n_S);
     fprintf(f, "Domain size (micrometers): %.1f\n", DOMAIN_SIZE);
-    fprintf(f, "Grid points: %d\n", N);
+    fprintf(f, "Grid points: %d\n", GRID_N);
     fprintf(f, "Grid spacing (micrometers): %.4f\n", DH);
     fprintf(f, "Dm_c6 = %.6e\n", input->dm_c6);
     fprintf(f, "Dm_c12 = %.6e\n", input->dm_c12);
     fprintf(f, "Dext_c6 = %.6e\n", input->de_c6);
     fprintf(f, "Dext_c12 = %.6e\n", input->de_c12);
+    fprintf(f, "C6_noise_frac = %.3f\n", input->c6_noise_frac);
+    fprintf(f, "C12_noise_frac = %.3f\n", input->c12_noise_frac);
+    fprintf(f, "Final_time_minutes = %.2f\n", cfg->final_time_minutes);
+    fprintf(f, "Min_convergence_minutes = %.2f\n", cfg->min_conv_minutes);
     fclose(f);
 }
 
@@ -602,7 +621,7 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
     size_t history_index = 0;
     if (cfg->enable_gui)
     {
-        viewer = viewer_create(N, N, viz_stride);
+        viewer = viewer_create(GRID_N, GRID_N, viz_stride);
         if (!viewer)
         {
             fprintf(stderr, "Failed to initialize GUI viewer, continuing headless.\n");
@@ -657,12 +676,13 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
         free_arrays(&arrays);
         return -1;
     }
-    write_metadata(sim_dir, input);
+    write_metadata(sim_dir, input, cfg);
 
     double convergence = 1.0;
     size_t step = 0;
     size_t snapshot_counter = 0;
-    while (convergence > cfg->tolerance && step < max_steps)
+    const double min_conv_minutes = cfg->min_conv_minutes;
+    while ((convergence > cfg->tolerance || (step * dt) < min_conv_minutes) && step < max_steps)
     {
 #ifdef WITH_GUI
         if (viewer)
@@ -754,9 +774,21 @@ static int run_simulation(const SimulationInput *input, const SimulationRunConfi
 /* -------------------------------------------------------------------------- */
 /* Default exploration sets                                                   */
 /* -------------------------------------------------------------------------- */
-static const double C6_CONCS[] = {
-    0.01148090, 0.00237850, 0.00124500, 0.00056350, 0.00033850,
-    0.00026450, 0.00022800, 0.00015900, 0.00014450, 0.00013450};
+// static const double C6_CONCS[] = {
+//     0.0114866, 0.0023850, 0.0012480, 0.0005676, 0.0003431,
+//     0.0002694, 0.0002331, 0.0001623, 0.0001487, 0.0001388};
+static const double C6_CONCS[] =
+    {0.011479302483635982,
+     0.002377898894988739,
+     0.0012412329321509008,
+     0.0005615533502252251,
+     0.00033788358671171174,
+     0.0002648754222972973,
+     0.00022903645833333334,
+     0.00015970228040540542,
+     0.00014640695382882885,
+     0.00013677153716216216};
+
 static const double DM_COEFFS[] = {
     0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 3.0, 5.0, 10.0};
 static const double DEXT_COEFFS[] = {
@@ -784,6 +816,8 @@ typedef struct
 {
     int replicas;
     double tolerance;
+    double min_conv_minutes;
+    int grid_points;
     size_t snapshot_stride;
     size_t max_steps;
     double final_time_minutes;
@@ -793,21 +827,27 @@ typedef struct
     size_t viz_stride;
     size_t dm_index;
     size_t de_index;
+    double c6_noise_frac;
+    double c12_noise_frac;
 } CliOptions;
 
 static void set_default_cli(CliOptions *opts)
 {
     opts->replicas = 1;
-    opts->tolerance = 1e-6;
+    opts->tolerance = 1e-8;
     opts->snapshot_stride = SNAPSHOT_STRIDE_DEFAULT;
     opts->max_steps = 0;
-    opts->final_time_minutes = 12.0 * 60.0;
+    opts->final_time_minutes = 24.0 * 60.0;
+    opts->min_conv_minutes = 720.0;
+    opts->grid_points = 256;
     opts->verbose = true;
     strncpy(opts->output_dir, OUTPUT_DIR_DEFAULT, sizeof(opts->output_dir));
     opts->gui = false;
-    opts->viz_stride = 500;
+    opts->viz_stride = 10;
     opts->dm_index = 0;
     opts->de_index = 0;
+    opts->c6_noise_frac = 0.25;
+    opts->c12_noise_frac = 0.25;
 }
 
 static void print_usage(const char *prog)
@@ -816,6 +856,8 @@ static void print_usage(const char *prog)
     printf("Options:\n");
     printf("  --replicas N          Number of replica batches (default 1)\n");
     printf("  --tol VALUE           Convergence tolerance (default 1e-6)\n");
+    printf("  --min-conv-time MIN   Minimum simulated minutes before convergence check can stop (default 0)\n");
+    printf("  --grid-size N         Lattice dimension (NxN) (default 256)\n");
     printf("  --snap STRIDE         Snapshot stride in steps (default 1000)\n");
     printf("  --max-steps N         Safety cap on steps (default derived from final time)\n");
     printf("  --final-time MIN      Nominal end time in minutes (default 720)\n");
@@ -824,6 +866,8 @@ static void print_usage(const char *prog)
     printf("  --viz-stride N        Steps between viewer refreshes (default 500)\n");
     printf("  --dm-index N          Select membrane diffusion coefficient index for GUI runs\n");
     printf("  --de-index N          Select external diffusion coefficient index for GUI runs\n");
+    printf("  --c6-noise-frac F     Std dev as fraction of mean for initial C6e noise (default 0.25)\n");
+    printf("  --c12-noise-frac F    Std dev as fraction of mean for initial C12e noise (default 0.25)\n");
     printf("  --quiet               Reduce stdout logging\n");
     printf("  --help                Show this message\n");
     printf("Enable OpenMP by compiling with -fopenmp and exporting OMP_NUM_THREADS.\n");
@@ -841,6 +885,22 @@ static bool parse_cli(int argc, char **argv, CliOptions *opts)
         else if (strcmp(argv[i], "--tol") == 0 && i + 1 < argc)
         {
             opts->tolerance = atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--min-conv-time") == 0 && i + 1 < argc)
+        {
+            opts->min_conv_minutes = atof(argv[++i]);
+            if (opts->min_conv_minutes < 0.0)
+            {
+                opts->min_conv_minutes = 0.0;
+            }
+        }
+        else if (strcmp(argv[i], "--grid-size") == 0 && i + 1 < argc)
+        {
+            opts->grid_points = atoi(argv[++i]);
+            if (opts->grid_points < 4)
+            {
+                opts->grid_points = 4;
+            }
         }
         else if (strcmp(argv[i], "--snap") == 0 && i + 1 < argc)
         {
@@ -874,6 +934,22 @@ static bool parse_cli(int argc, char **argv, CliOptions *opts)
         else if (strcmp(argv[i], "--de-index") == 0 && i + 1 < argc)
         {
             opts->de_index = (size_t)strtoull(argv[++i], NULL, 10);
+        }
+        else if (strcmp(argv[i], "--c6-noise-frac") == 0 && i + 1 < argc)
+        {
+            opts->c6_noise_frac = atof(argv[++i]);
+            if (opts->c6_noise_frac < 0.0)
+            {
+                opts->c6_noise_frac = 0.0;
+            }
+        }
+        else if (strcmp(argv[i], "--c12-noise-frac") == 0 && i + 1 < argc)
+        {
+            opts->c12_noise_frac = atof(argv[++i]);
+            if (opts->c12_noise_frac < 0.0)
+            {
+                opts->c12_noise_frac = 0.0;
+            }
         }
         else if (strcmp(argv[i], "--quiet") == 0)
         {
@@ -924,6 +1000,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    set_grid_geometry(cli.grid_points);
+
     if (ensure_dir(cli.output_dir) != 0)
     {
         fprintf(stderr, "Could not create output directory %s: %s\n", cli.output_dir, strerror(errno));
@@ -959,9 +1037,12 @@ int main(int argc, char **argv)
             .de_c6 = DEXT_COEFFS[de_idx],
             .de_c12 = DEXT_COEFFS[de_idx],
             .c6_conc = C6_CONCS[job],
-            .c12_conc = 0.0};
+            .c12_conc = 0.0,
+            .c6_noise_frac = cli.c6_noise_frac,
+            .c12_noise_frac = cli.c12_noise_frac};
         SimulationRunConfig cfg = {
             .final_time_minutes = cli.final_time_minutes,
+            .min_conv_minutes = cli.min_conv_minutes,
             .tolerance = cli.tolerance,
             .max_steps = cli.max_steps,
             .snapshot_stride = cli.snapshot_stride,
@@ -998,10 +1079,13 @@ int main(int argc, char **argv)
                     .de_c6 = de_c6,
                     .de_c12 = de_c12,
                     .c6_conc = C6_CONCS[job],
-                    .c12_conc = 0.0};
+                    .c12_conc = 0.0,
+                    .c6_noise_frac = cli.c6_noise_frac,
+                    .c12_noise_frac = cli.c12_noise_frac};
 
                 SimulationRunConfig cfg = {
                     .final_time_minutes = cli.final_time_minutes,
+                    .min_conv_minutes = cli.min_conv_minutes,
                     .tolerance = cli.tolerance,
                     .max_steps = cli.max_steps,
                     .snapshot_stride = cli.snapshot_stride,
