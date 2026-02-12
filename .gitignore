@@ -5,6 +5,16 @@
 # Ignore plain text outputs (e.g., simulation logs/parameters)
 *.txt
 
+# Ignore generated RDIM simulation outputs
+c_runs*/
+c_runs_gradient/
+c_impl/c_rdim_outputs/
+
+# Ignore local build artifacts
+c_impl/*.o
+c_impl/rdim_model_gradient
+c_impl/rdim_model_simulations
+
 # OS / editor files
 .DS_Store
 .vscode/

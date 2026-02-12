@@ -21,14 +21,15 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define DOMAIN_SIZE 256.0
 #define DT 0.001
 #define SNAPSHOT_STRIDE_DEFAULT 1000
 #define OUTPUT_DIR_DEFAULT "c_rdim_outputs"
 
+static const double PIXEL_SIZE_UM = 1.0;
 static int GRID_N = 256;
-static double DH = DOMAIN_SIZE / 256.0;
-static double DH2_INV = 1.0 / (256.0 * 256.0 / (DOMAIN_SIZE * DOMAIN_SIZE));
+static double DOMAIN_SIZE_UM = 256.0;
+static double DH = 1.0;
+static double DH2_INV = 1.0;
 static size_t GRID_TOTAL = (size_t)256 * (size_t)256;
 
 static void set_grid_geometry(int n)
@@ -38,7 +39,8 @@ static void set_grid_geometry(int n)
         n = 4;
     }
     GRID_N = n;
-    DH = DOMAIN_SIZE / (double)GRID_N;
+    DOMAIN_SIZE_UM = (double)GRID_N * PIXEL_SIZE_UM;
+    DH = DOMAIN_SIZE_UM / (double)GRID_N;
     DH2_INV = 1.0 / (DH * DH);
     GRID_TOTAL = (size_t)GRID_N * (size_t)GRID_N;
 }
@@ -489,7 +491,7 @@ static void write_metadata(const char *dir_path, const SimulationInput *input, c
     fprintf(f, "K_LAC = %.6e\n", K_LAC);
     fprintf(f, "n_R = %.2f\n", n_R);
     fprintf(f, "n_S = %.2f\n", n_S);
-    fprintf(f, "Domain size (micrometers): %.1f\n", DOMAIN_SIZE);
+    fprintf(f, "Domain size (micrometers): %.1f\n", DOMAIN_SIZE_UM);
     fprintf(f, "Grid points: %d\n", GRID_N);
     fprintf(f, "Grid spacing (micrometers): %.4f\n", DH);
     fprintf(f, "Dm_c6 = %.6e\n", input->dm_c6);

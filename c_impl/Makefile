@@ -5,9 +5,11 @@ CXXFLAGS ?= -O3 -march=native -std=c++17 -Wall -Wextra -pedantic
 CPPFLAGS ?=
 LDFLAGS ?=
 LDLIBS ?=
-TARGET := rdim_model_simulations
+SIM_TARGET := rdim_model_simulations
+GRAD_TARGET := rdim_model_gradient
 
-SRC_C := rdim_model_simulations.c
+SIM_SRC_C := rdim_model_simulations.c
+GRAD_SRC_C := rdim_model_gradient.c
 SRC_CPP :=
 
 GUI ?= 0
@@ -38,14 +40,18 @@ LDFLAGS += $(SDL2_LIBS)
 LINK := $(CXX)
 endif
 
-OBJ := $(SRC_C:.c=.o) $(SRC_CPP:.cpp=.o)
+SIM_OBJ := $(SIM_SRC_C:.c=.o) $(SRC_CPP:.cpp=.o)
+GRAD_OBJ := $(GRAD_SRC_C:.c=.o)
 
 .PHONY: all clean
 
-all: $(TARGET)
+all: $(SIM_TARGET) $(GRAD_TARGET)
 
-$(TARGET): $(OBJ)
-	$(LINK) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+$(SIM_TARGET): $(SIM_OBJ)
+	$(LINK) $(SIM_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(GRAD_TARGET): $(GRAD_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(GRAD_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
@@ -54,4 +60,4 @@ $(TARGET): $(OBJ)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(OBJ)
+	rm -f $(SIM_TARGET) $(GRAD_TARGET) $(SIM_OBJ) $(GRAD_OBJ)
